@@ -1,0 +1,107 @@
+name: Publish Windows executable
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/release-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish Bookcheckbot.exe
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable with Windows MSVC target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Run Rust unit tests
+        run: cargo test --verbose
+
+      - name: Compile Windows x64 release binary
+        run: cargo build --release --target x86_64-pc-windows-msvc --verbose
+
+      - name: Smoke-test executable
+        shell: pwsh
+        run: |
+          $exe = "target/x86_64-pc-windows-msvc/release/bookcheckbot.exe"
+          if (-not (Test-Path $exe)) { throw "Compiled executable does not exist: $exe" }
+          & $exe --help
+          if ($LASTEXITCODE -ne 0) { throw "The executable failed its --help smoke test." }
+
+      - name: Prepare executable, ZIP, and SHA-256 checksums
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/bookcheckbot.exe" "dist/Bookcheckbot.exe"
+          Copy-Item "README.md" "dist/README.md"
+          Copy-Item "RUN_WINDOWS.md" "dist/RUN_WINDOWS.md"
+          Compress-Archive -Path "dist/Bookcheckbot.exe", "dist/README.md", "dist/RUN_WINDOWS.md" -DestinationPath "Bookcheckbot-Windows-x64.zip" -CompressionLevel Optimal -Force
+          $exeHash = (Get-FileHash "dist/Bookcheckbot.exe" -Algorithm SHA256).Hash.ToLower()
+          $zipHash = (Get-FileHash "Bookcheckbot-Windows-x64.zip" -Algorithm SHA256).Hash.ToLower()
+          @(
+            "$exeHash  Bookcheckbot.exe",
+            "$zipHash  Bookcheckbot-Windows-x64.zip"
+          ) | Set-Content -Path "SHA256SUMS.txt" -Encoding utf8
+
+      - name: Publish GitHub release v0.1.0
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          @'
+          # Bookcheckbot v0.1.0 — Windows 11 x64
+
+          Windows 11용 Rust 전자책 화면 캡처 CLI 첫 실행 파일 릴리스입니다.
+
+          **다운로드**
+          - `Bookcheckbot-Windows-x64.zip`: 실행 파일 + 한국어 사용 설명서 (권장)
+          - `Bookcheckbot.exe`: 단일 실행 파일
+          - `SHA256SUMS.txt`: 파일 무결성 확인용
+
+          **실행**
+          ZIP 압축을 풀고 해당 폴더의 PowerShell에서:
+          ```powershell
+          .\Bookcheckbot.exe --pages 3 --out test
+          ```
+          실제 페이지 범위, 캡처 좌표, 넘김 방식은 `README.md`와 `RUN_WINDOWS.md`에서 확인하세요.
+
+          * 64비트 Windows 실행 파일이며 Rust 설치가 필요하지 않습니다.
+          * GUI 앱이 아닌 명령줄 도구입니다. 더블클릭 대신 PowerShell에서 인자를 전달하세요.
+          * 코드 서명이 없는 실행 파일이므로 Windows SmartScreen 경고가 뜰 수 있습니다.
+          * DRM 및 캡처 제한을 우회하지 않습니다. 캡처가 허용된 콘텐츠에만 사용하세요.
+          '@ | Set-Content -Path "release-notes.md" -Encoding utf8
+          $tag = "v0.1.0"
+          $assets = @(
+            "dist/Bookcheckbot.exe",
+            "Bookcheckbot-Windows-x64.zip",
+            "SHA256SUMS.txt"
+          )
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --title "Bookcheckbot v0.1.0 (Windows x64)" --notes-file "release-notes.md" --target $env:GITHUB_SHA
+          }
+          if ($LASTEXITCODE -ne 0) { throw "GitHub release publication failed." }
+
+      - name: Verify published GitHub release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $release = gh release view "v0.1.0" --json url,assets | ConvertFrom-Json
+          $names = @($release.assets | ForEach-Object { $_.name })
+          foreach ($needed in @("Bookcheckbot.exe", "Bookcheckbot-Windows-x64.zip", "SHA256SUMS.txt")) {
+            if ($names -notcontains $needed) { throw "Missing release asset: $needed" }
+          }
+          Write-Host "Release OK:" $release.url
+          $release.assets | Select-Object name,size | Format-Table
